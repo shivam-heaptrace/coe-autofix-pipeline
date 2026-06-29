@@ -36,3 +36,5 @@ venv/
 .idea/
 *.swp
 *.swo
+
+trivy-local-results.json

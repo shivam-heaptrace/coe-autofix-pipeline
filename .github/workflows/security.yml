@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: javascript-typescript
           # Point at your source; adjust if your code lives elsewhere
@@ -36,10 +36,10 @@ jobs:
           queries: security-and-quality
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+        uses: github/codeql-action/autobuild@v4
 
       - name: Run CodeQL analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:javascript-typescript"
           # SARIF goes to GitHub's Security tab; also saved as artifact below
@@ -77,7 +77,7 @@ jobs:
 
       - name: Upload Trivy SARIF to GitHub Security tab
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
           category: trivy
@@ -142,18 +142,33 @@ jobs:
           fetch-depth: 0
 
       - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: detect --source . --format sarif --report-path gitleaks-results.sarif --exit-code 1
 
-      - name: Upload Gitleaks SARIF
+      # gitleaks-action always writes results.sarif; --report-path in args is ignored
+      - name: Stage Gitleaks SARIF for upload
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        run: |
+          if [ -f results.sarif ]; then
+            cp results.sarif gitleaks-results.sarif
+          fi
+
+      - name: Upload Gitleaks SARIF to GitHub Security tab
+        if: always() && hashFiles('gitleaks-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: gitleaks-results.sarif
           category: gitleaks
+
+      - name: Upload Gitleaks SARIF artifact
+        if: always() && hashFiles('gitleaks-results.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif
+          path: gitleaks-results.sarif
+          retention-days: 7
 
       - name: Comment on PR if secrets found
         if: failure() && github.event_name == 'pull_request'
@@ -197,7 +212,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: src/package-lock.json
 
@@ -207,7 +222,7 @@ jobs:
 
       - name: Run tests with coverage
         working-directory: src
-        run: npm test -- --coverage --coverageReporters=lcov --if-present
+        run: npm test --if-present -- --coverageReporters=lcov
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@master

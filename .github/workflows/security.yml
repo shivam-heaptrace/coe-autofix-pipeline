@@ -53,6 +53,48 @@ jobs:
           path: codeql-results.sarif
           retention-days: 7
 
+      - name: Comment on PR with CodeQL findings
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let lines = [];
+            try {
+              const sarif   = JSON.parse(fs.readFileSync('codeql-results.sarif', 'utf8'));
+              const results = sarif.runs?.[0]?.results ?? [];
+              lines = results.slice(0, 10).map(r => {
+                const rule = r.ruleId ?? 'unknown';
+                const msg  = r.message?.text ?? '';
+                const uri  = r.locations?.[0]?.physicalLocation?.artifactLocation?.uri ?? '';
+                const ln   = r.locations?.[0]?.physicalLocation?.region?.startLine;
+                return `- **${rule}** in \`${uri}${ln ? ':' + ln : ''}\`: ${msg}`;
+              });
+              if (results.length > 10)
+                lines.push(`\n_…and ${results.length - 10} more. See the [Security tab](../../security/code-scanning)._`);
+              if (results.length === 0)
+                lines = ['_No structured results found in SARIF output._'];
+            } catch {
+              lines = ['_Could not parse CodeQL SARIF output._'];
+            }
+
+            const body = [
+              '## 🔬 CodeQL Analysis Findings',
+              '',
+              'CodeQL detected the following issues in this branch.',
+              '',
+              ...lines,
+              '',
+              '> See the [Security tab](../../security/code-scanning) for the full report.',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
+
   # ──────────────────────────────────────────────
   # 2. Trivy — container & filesystem vulnerability scan
   # ──────────────────────────────────────────────
@@ -229,6 +271,38 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN:  ${{ secrets.SONAR_TOKEN }}
+
+      - name: Comment on PR if SonarCloud quality gate failed
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const org  = context.repo.owner;
+            const repo = context.repo.repo;
+            const prUrl = context.payload.pull_request.html_url;
+            const dashboardUrl = `https://sonarcloud.io/summary/new_code?id=${org}_${repo}`;
+
+            const body = [
+              '## 📊 SonarCloud Quality Gate Failed',
+              '',
+              `The SonarCloud quality gate did not pass for this branch.`,
+              '',
+              `**[View analysis on SonarCloud](${dashboardUrl})**`,
+              '',
+              'Common causes:',
+              '- New security hotspots or vulnerabilities introduced',
+              '- Code coverage dropped below the required threshold',
+              '- New bugs or code smells exceeded the gate thresholds',
+              '',
+              '> SonarCloud also posts its own inline PR decoration above — check that comment for line-level details.',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
 
   # ──────────────────────────────────────────────
   # 5. Combined security report — PR comment + Slack

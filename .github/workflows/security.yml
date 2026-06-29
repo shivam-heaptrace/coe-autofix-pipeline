@@ -1,0 +1,216 @@
+name: Security Scan
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Run nightly at 02:00 UTC on main
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: read
+  security-events: write   # required for SARIF upload
+  pull-requests: write     # allows posting PR comments on findings
+  actions: read
+
+jobs:
+  # ──────────────────────────────────────────────
+  # 1. CodeQL — static analysis (JS/TS by default;
+  #    add "python", "go", etc. if your stack changes)
+  # ──────────────────────────────────────────────
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          # Point at your source; adjust if your code lives elsewhere
+          source-root: src
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Run CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"
+          # SARIF goes to GitHub's Security tab; also saved as artifact below
+          output: codeql-results.sarif
+
+      - name: Upload CodeQL SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif
+          path: codeql-results.sarif
+          retention-days: 7
+
+  # ──────────────────────────────────────────────
+  # 2. Trivy — container & filesystem vulnerability scan
+  # ──────────────────────────────────────────────
+  trivy:
+    name: Trivy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          # Treat HIGH+ findings as a blocking failure
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+      - name: Upload Trivy SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sarif
+          path: trivy-results.sarif
+          retention-days: 7
+
+      # ── Post a plain-English summary comment on the PR ──
+      - name: Parse Trivy findings and comment on PR
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const sarif = JSON.parse(fs.readFileSync('trivy-results.sarif', 'utf8'));
+            const results = sarif.runs?.[0]?.results ?? [];
+            if (results.length === 0) return;
+
+            const lines = results.slice(0, 10).map(r => {
+              const rule = r.ruleId ?? 'unknown';
+              const msg  = r.message?.text ?? '';
+              const loc  = r.locations?.[0]?.physicalLocation?.artifactLocation?.uri ?? '';
+              return `- **${rule}** in \`${loc}\`: ${msg}`;
+            });
+            const more = results.length > 10 ? `\n…and ${results.length - 10} more findings.` : '';
+
+            const body = [
+              '## 🔍 Trivy Security Findings',
+              '',
+              'The following vulnerabilities were detected. The **autofix workflow** will attempt to patch them.',
+              '',
+              '<!-- trivy-findings-start -->',
+              ...lines,
+              more,
+              '<!-- trivy-findings-end -->',
+              '',
+              '> Trigger: post this comment or push a fix commit to re-run autofix.',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
+
+  # ──────────────────────────────────────────────
+  # 3. Secret scanning via Gitleaks
+  # ──────────────────────────────────────────────
+  secret-scan:
+    name: Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for secret detection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: detect --source . --format sarif --report-path gitleaks-results.sarif --exit-code 1
+
+      - name: Upload Gitleaks SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks-results.sarif
+          category: gitleaks
+
+      - name: Comment on PR if secrets found
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              '## 🚨 Secret Scan Failure',
+              '',
+              'Gitleaks detected a potential secret or credential in this branch.',
+              '',
+              '**Do not merge.** Rotate the credential immediately if it is real.',
+              '',
+              'The autofix workflow will flag the file and line, but **it cannot safely',
+              'remove a secret that has already been committed** — you must rotate first,',
+              'then remove the value and force-push to clear history, or use `git filter-repo`.',
+              '',
+              '> See the Security tab for the full Gitleaks SARIF report.',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
+
+  # ──────────────────────────────────────────────
+  # 4. SonarCloud quality gate
+  #    Requires: SONAR_TOKEN secret, sonar-project.properties in repo root
+  # ──────────────────────────────────────────────
+  sonar:
+    name: SonarCloud
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for blame info)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: src/package-lock.json
+
+      - name: Install dependencies
+        working-directory: src
+        run: npm ci
+
+      - name: Run tests with coverage
+        working-directory: src
+        run: npm test -- --coverage --coverageReporters=lcov --if-present
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN:  ${{ secrets.SONAR_TOKEN }}

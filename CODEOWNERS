@@ -1,0 +1,41 @@
+# CODEOWNERS — Fulcrum AI COE POC
+# ─────────────────────────────────────────────────────────────────────────────
+# Route PR reviews to the right owner based on what changed.
+# GitHub enforces these as required reviewers when branch protection is on.
+#
+# Format: <path pattern>  <@owner or team>
+# Last matching rule wins for a given file.
+#
+# Teams to create in your GitHub org:
+#   @<org>/coe-engineering   — DevSavant engineers
+#   @<org>/coe-security      — Fulcrum security / compliance
+#   @<org>/coe-operations    — Fulcrum operations / COE owners
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default: everything needs engineering + security review
+*  @<org>/coe-engineering @<org>/coe-security
+
+# Workflow YAML changes always include security
+.github/workflows/  @<org>/coe-engineering @<org>/coe-security
+
+# Autofix commits — security must approve before merge
+autofix-summary.md  @<org>/coe-security @<org>/coe-operations
+
+# n8n workflow JSON — operations owner approves
+workflows/          @<org>/coe-engineering @<org>/coe-operations
+
+# Documentation and playbooks — COE operations + engineering
+docs/               @<org>/coe-engineering @<org>/coe-operations
+
+# Source — engineering lead owns
+src/                @<org>/coe-engineering
+
+# Infrastructure / deployment config — security + engineering
+infra/              @<org>/coe-engineering @<org>/coe-security
+
+# Dependency manifests — security always reviews
+src/package.json    @<org>/coe-security @<org>/coe-engineering
+src/package-lock.json  @<org>/coe-security
+requirements.txt    @<org>/coe-security
+go.mod              @<org>/coe-security
+go.sum              @<org>/coe-security

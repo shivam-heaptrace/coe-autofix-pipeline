@@ -1,0 +1,255 @@
+name: Claude Autofix
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers
+#
+# 1. issue_comment — fires when a bot (Trivy, CodeQL, Gitleaks) posts a
+#    findings comment on a PR. Only acts on comments that contain the
+#    sentinel markers written by the security workflow.
+#
+# 2. workflow_run — fires when the Security Scan workflow finishes on a PR
+#    branch. Lets us react even if the scanner didn't post a PR comment
+#    (e.g. nightly scheduled run or direct push).
+#
+# 3. workflow_dispatch — manual trigger for testing or re-running autofix.
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  issue_comment:
+    types: [created]
+  workflow_run:
+    workflows: ["Security Scan"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to autofix"
+        required: true
+        type: number
+
+permissions:
+  contents: write        # push fix commits to the PR branch
+  pull-requests: write   # post status comments
+  security-events: read  # read SARIF/Security tab findings
+  actions: read          # download workflow artifacts
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # Gate: only proceed when triggered by a bot findings comment
+  # or a completed Security Scan on a PR branch.
+  # ──────────────────────────────────────────────────────────
+  gate:
+    name: Gate — should autofix run?
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      pr_number:  ${{ steps.check.outputs.pr_number }}
+      branch:     ${{ steps.check.outputs.branch }}
+    steps:
+      - name: Evaluate trigger
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eventName = context.eventName;
+            let shouldRun = false;
+            let prNumber  = '';
+            let branch    = '';
+
+            if (eventName === 'issue_comment') {
+              const body = context.payload.comment?.body ?? '';
+              // Only react to our own sentinel markers from the security workflow
+              const isFindingsComment =
+                body.includes('<!-- trivy-findings-start -->') ||
+                body.includes('🚨 Secret Scan Failure')        ||
+                body.includes('## 🔍 Trivy Security Findings');
+
+              if (isFindingsComment && context.payload.issue?.pull_request) {
+                shouldRun = true;
+                prNumber  = String(context.payload.issue.number);
+              }
+            }
+
+            if (eventName === 'workflow_run') {
+              const run = context.payload.workflow_run;
+              if (run.conclusion === 'failure' && run.pull_requests?.length) {
+                shouldRun = true;
+                prNumber  = String(run.pull_requests[0].number);
+                branch    = run.pull_requests[0].head.ref;
+              }
+            }
+
+            if (eventName === 'workflow_dispatch') {
+              shouldRun = true;
+              prNumber  = String(context.payload.inputs.pr_number);
+            }
+
+            core.setOutput('should_run', shouldRun ? 'true' : 'false');
+            core.setOutput('pr_number',  prNumber);
+            core.setOutput('branch',     branch);
+            core.info(`should_run=${shouldRun}, pr=${prNumber}, branch=${branch}`);
+
+  # ──────────────────────────────────────────────────────────
+  # Autofix: collect findings → build prompt → Claude fixes
+  # ──────────────────────────────────────────────────────────
+  autofix:
+    name: Claude Autofix
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve PR branch
+        id: pr-meta
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNum = Number('${{ needs.gate.outputs.pr_number }}');
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              pull_number: prNum,
+            });
+            core.setOutput('branch', pr.head.ref);
+            core.setOutput('sha',    pr.head.sha);
+            core.info(`PR #${prNum} — branch: ${pr.head.ref}, sha: ${pr.head.sha}`);
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr-meta.outputs.branch }}
+          # Use a PAT (not GITHUB_TOKEN) so the push triggers CI again
+          token: ${{ secrets.AUTOFIX_PAT }}
+          fetch-depth: 0
+
+      # ── Download SARIF artifacts from the failed security run ──
+      - name: Download security artifacts
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: security.yml
+          pr:       ${{ needs.gate.outputs.pr_number }}
+          name:     "*-sarif"
+          path:     security-artifacts/
+        continue-on-error: true   # artifacts may not exist on first attempt
+
+      # ── Collapse SARIF files into a compact JSON payload for Claude ──
+      - name: Build findings payload
+        id: findings
+        run: |
+          python3 scripts/sarif_to_findings.py \
+            --input-dir security-artifacts/ \
+            --output    findings.json
+          echo "count=$(python3 -c "import json; d=json.load(open('findings.json')); print(d['total'])")" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if no findings
+        if: steps.findings.outputs.count == '0'
+        run: |
+          echo "No SARIF findings to fix. Exiting."
+          exit 0
+
+      # ── Claude Code autofix ──
+      # Reads findings.json, patches affected files, pushes back to the branch.
+      # The action prompt is kept minimal — findings.json carries all context.
+      - name: Run Claude autofix
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Optional: restrict the model to save cost on smaller fixes
+          # model: claude-sonnet-4-6
+          allowed_tools: "Bash,Read,Write,Edit"
+          disallowed_tools: "WebSearch"
+          prompt: |
+            You are a security engineer fixing issues found by automated scanners.
+            A file called `findings.json` in the repo root contains structured
+            findings from CodeQL, Trivy, and Gitleaks. Each finding has:
+              - tool: scanner name
+              - ruleId: the rule or CVE
+              - severity: CRITICAL | HIGH | MEDIUM | LOW
+              - file: path relative to repo root
+              - startLine / endLine: affected lines (if known)
+              - message: human-readable description
+
+            Your task:
+            1. Read findings.json.
+            2. For each finding, read the affected file and understand the issue.
+            3. Apply the minimal safe fix:
+               - For dependency vulnerabilities (Trivy): update the version in
+                 package.json / requirements.txt / go.mod to the lowest fixed
+                 version that resolves the CVE. Run `npm install` / `pip install`
+                 if needed to regenerate the lock file.
+               - For code issues (CodeQL): patch the specific lines. Prefer safe
+                 alternatives (e.g. parameterised queries, safe HTML escaping).
+               - For secrets (Gitleaks): replace the literal value with a
+                 placeholder like `process.env.MY_SECRET` and add a comment
+                 explaining that the real value must come from environment
+                 variables or a secrets manager. Do NOT invent or commit real
+                 credentials.
+            4. After patching, write a short summary of changes made to
+               `autofix-summary.md`. Include: finding, file, line, action taken.
+            5. Do not modify files unrelated to a finding.
+            6. Do not push — the workflow handles the commit and push.
+
+            Constraints:
+            - HITL default: if you are unsure whether a fix is safe, write a
+              comment in the file (# AUTOFIX NEEDS REVIEW: <reason>) and add
+              the finding to a `needs-human-review` section in autofix-summary.md.
+              Never bypass governance by guessing.
+            - Never commit real secrets or credentials.
+            - Never delete tests.
+            - Limit each file edit to the lines identified in the finding.
+
+      # ── Commit and push ──
+      - name: Commit and push fixes
+        run: |
+          git config user.name  "autofix-bot[bot]"
+          git config user.email "autofix-bot@users.noreply.github.com"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          FINDING_COUNT="${{ steps.findings.outputs.count }}"
+          git commit -m "fix(autofix): Claude patched ${FINDING_COUNT} security finding(s)
+
+          Triggered by: ${{ github.event_name }}
+          PR: #${{ needs.gate.outputs.pr_number }}
+          Run: ${{ github.run_id }}
+
+          See autofix-summary.md for details."
+
+          git push origin HEAD:${{ steps.pr-meta.outputs.branch }}
+
+      # ── Post a status comment on the PR ──
+      - name: Comment with autofix result
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let summary = '';
+            try {
+              summary = fs.readFileSync('autofix-summary.md', 'utf8');
+            } catch {
+              summary = '_autofix-summary.md was not generated._';
+            }
+
+            const status = '${{ job.status }}' === 'success'
+              ? '✅ Autofix complete — CI will re-run automatically.'
+              : '⚠️ Autofix encountered errors — manual review required.';
+
+            const body = [
+              `## 🤖 Claude Autofix — ${status}`,
+              '',
+              summary,
+              '',
+              '---',
+              `> Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: Number('${{ needs.gate.outputs.pr_number }}'),
+              body,
+            });

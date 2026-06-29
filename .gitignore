@@ -12,6 +12,7 @@ local/
 
 # Scanner / autofix artifacts (CI-generated; not source)
 *.sarif
+results.sarif
 findings.json
 
 # Logs

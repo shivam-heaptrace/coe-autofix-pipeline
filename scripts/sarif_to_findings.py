@@ -133,6 +133,8 @@ def infer_tool_name(filename: str) -> str:
 
 
 def main():
+    global MIN_SEVERITY
+
     parser = argparse.ArgumentParser(description="Collapse SARIF files into findings.json")
     parser.add_argument("--input-dir", required=True, help="Directory containing *.sarif files")
     parser.add_argument("--output",    required=True, help="Output JSON path")
@@ -141,7 +143,6 @@ def main():
                         help="Minimum severity to include (default: MEDIUM)")
     args = parser.parse_args()
 
-    global MIN_SEVERITY
     MIN_SEVERITY = args.min_severity
 
     input_dir = Path(args.input_dir)

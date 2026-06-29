@@ -53,6 +53,48 @@ jobs:
           path: codeql-results.sarif
           retention-days: 7
 
+      - name: Comment on PR with CodeQL findings
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let lines = [];
+            try {
+              const sarif   = JSON.parse(fs.readFileSync('codeql-results.sarif', 'utf8'));
+              const results = sarif.runs?.[0]?.results ?? [];
+              lines = results.slice(0, 10).map(r => {
+                const rule = r.ruleId ?? 'unknown';
+                const msg  = r.message?.text ?? '';
+                const uri  = r.locations?.[0]?.physicalLocation?.artifactLocation?.uri ?? '';
+                const ln   = r.locations?.[0]?.physicalLocation?.region?.startLine;
+                return `- **${rule}** in \`${uri}${ln ? ':' + ln : ''}\`: ${msg}`;
+              });
+              if (results.length > 10)
+                lines.push(`\n_…and ${results.length - 10} more. See the [Security tab](../../security/code-scanning)._`);
+              if (results.length === 0)
+                lines = ['_No structured results found in SARIF output._'];
+            } catch {
+              lines = ['_Could not parse CodeQL SARIF output._'];
+            }
+
+            const body = [
+              '## 🔬 CodeQL Analysis Findings',
+              '',
+              'CodeQL detected the following issues in this branch.',
+              '',
+              ...lines,
+              '',
+              '> See the [Security tab](../../security/code-scanning) for the full report.',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
+
   # ──────────────────────────────────────────────
   # 2. Trivy — container & filesystem vulnerability scan
   # ──────────────────────────────────────────────
@@ -229,3 +271,280 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN:  ${{ secrets.SONAR_TOKEN }}
+
+      - name: Comment on PR if SonarCloud quality gate failed
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const org  = context.repo.owner;
+            const repo = context.repo.repo;
+            const prUrl = context.payload.pull_request.html_url;
+            const dashboardUrl = `https://sonarcloud.io/summary/new_code?id=${org}_${repo}`;
+
+            const body = [
+              '## 📊 SonarCloud Quality Gate Failed',
+              '',
+              `The SonarCloud quality gate did not pass for this branch.`,
+              '',
+              `**[View analysis on SonarCloud](${dashboardUrl})**`,
+              '',
+              'Common causes:',
+              '- New security hotspots or vulnerabilities introduced',
+              '- Code coverage dropped below the required threshold',
+              '- New bugs or code smells exceeded the gate thresholds',
+              '',
+              '> SonarCloud also posts its own inline PR decoration above — check that comment for line-level details.',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
+
+  # ──────────────────────────────────────────────
+  # 5. Combined security report — PR comment + Slack
+  #    Requires: SLACK_WEBHOOK_URL secret (Slack Incoming Webhook URL)
+  # ──────────────────────────────────────────────
+  report:
+    name: Security Report
+    needs: [codeql, trivy, secret-scan, sonar]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Download all SARIF artifacts produced by the scanner jobs above
+      - name: Download SARIF artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: security-artifacts/
+        continue-on-error: true
+
+      # Parse every *.sarif file in the artifacts dir into findings.json
+      # and emit per-severity counts as step outputs
+      - name: Build findings JSON
+        id: findings
+        run: |
+          python3 scripts/sarif_to_findings.py \
+            --input-dir security-artifacts/ \
+            --output    findings.json \
+            --min-severity MEDIUM
+
+          python3 - <<'PYEOF'
+          import json, os
+          d = json.load(open("findings.json"))
+          counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
+          for f in d["findings"]:
+              sev = f["severity"]
+              if sev in counts:
+                  counts[sev] += 1
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a") as fh:
+              fh.write(f"count={d['total']}\n")
+              fh.write(f"critical={counts['CRITICAL']}\n")
+              fh.write(f"high={counts['HIGH']}\n")
+              fh.write(f"medium={counts['MEDIUM']}\n")
+          PYEOF
+
+      # Post (or update) a single combined markdown comment on the PR
+      - name: Post combined PR comment
+        uses: actions/github-script@v7
+        env:
+          CODEQL_RESULT:      ${{ needs.codeql.result }}
+          TRIVY_RESULT:       ${{ needs.trivy.result }}
+          SECRET_SCAN_RESULT: ${{ needs.secret-scan.result }}
+          SONAR_RESULT:       ${{ needs.sonar.result }}
+          FINDING_COUNT:      ${{ steps.findings.outputs.count }}
+          CRITICAL_COUNT:     ${{ steps.findings.outputs.critical }}
+          HIGH_COUNT:         ${{ steps.findings.outputs.high }}
+          MEDIUM_COUNT:       ${{ steps.findings.outputs.medium }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const icon  = (r) => ({ success: '✅', failure: '❌', skipped: '⏭️' }[r] ?? '⚪');
+            const crit  = Number(process.env.CRITICAL_COUNT  || 0);
+            const high  = Number(process.env.HIGH_COUNT       || 0);
+            const med   = Number(process.env.MEDIUM_COUNT     || 0);
+            const total = Number(process.env.FINDING_COUNT    || 0);
+
+            const overall =
+              crit > 0 || high > 0 ? '🔴 **FAILED** — critical / high findings require attention'
+              : total > 0           ? '🟡 **WARNINGS** — medium-severity findings detected'
+              :                       '🟢 **PASSED** — no significant findings';
+
+            // Build top-findings table from findings.json
+            let findingsSection = '';
+            try {
+              const data = JSON.parse(fs.readFileSync('findings.json', 'utf8'));
+              const top  = data.findings.slice(0, 10);
+              if (top.length > 0) {
+                const rows = top.map(f => {
+                  const loc = f.file
+                    ? `\`${f.file}${f.startLine ? ':' + f.startLine : ''}\``
+                    : '—';
+                  const msg = (f.message || '').slice(0, 80).replace(/\|/g, '\\|');
+                  return `| ${f.tool} | **${f.severity}** | \`${f.ruleId}\` | ${loc} | ${msg} |`;
+                }).join('\n');
+                const more = data.findings.length > 10
+                  ? `\n_…and ${data.findings.length - 10} more. See the [Security tab](../../security/code-scanning) for full results._`
+                  : '';
+                findingsSection = [
+                  '',
+                  '### Top Findings',
+                  '',
+                  '| Tool | Severity | Rule | Location | Message |',
+                  '|------|----------|------|----------|---------|',
+                  rows,
+                  more,
+                ].join('\n');
+              }
+            } catch {
+              findingsSection = '\n_Could not parse findings.json._';
+            }
+
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+
+            const MARKER = '<!-- security-report -->';
+            const body = [
+              MARKER,
+              '## 🛡️ Security Scan Report',
+              '',
+              `**Status**: ${overall}`,
+              '',
+              '### Scanner Results',
+              '',
+              '| Scanner | Status |',
+              '|---------|--------|',
+              `| CodeQL             | ${icon(process.env.CODEQL_RESULT)} ${process.env.CODEQL_RESULT} |`,
+              `| Trivy              | ${icon(process.env.TRIVY_RESULT)} ${process.env.TRIVY_RESULT} |`,
+              `| Gitleaks (secrets) | ${icon(process.env.SECRET_SCAN_RESULT)} ${process.env.SECRET_SCAN_RESULT} |`,
+              `| SonarCloud         | ${icon(process.env.SONAR_RESULT)} ${process.env.SONAR_RESULT} |`,
+              '',
+              '### Severity Summary',
+              '',
+              '| 🔴 Critical | 🟠 High | 🟡 Medium |',
+              '|:-----------:|:-------:|:---------:|',
+              `| ${crit} | ${high} | ${med} |`,
+              findingsSection,
+              '',
+              '---',
+              `> [View full run](${runUrl}) · The autofix workflow triggers automatically on failure.`,
+            ].join('\n');
+
+            // Upsert: update existing report comment if present, otherwise create
+            const { data: comments } = await github.rest.issues.listComments({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(MARKER));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+              core.info(`Updated existing report comment #${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+              core.info('Created new report comment');
+            }
+
+      # Send a concise summary to Slack via Incoming Webhook
+      # Set SLACK_WEBHOOK_URL in repo/org secrets to enable this step
+      - name: Send Slack notification
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          CODEQL_RESULT:      ${{ needs.codeql.result }}
+          TRIVY_RESULT:       ${{ needs.trivy.result }}
+          SECRET_SCAN_RESULT: ${{ needs.secret-scan.result }}
+          SONAR_RESULT:       ${{ needs.sonar.result }}
+          FINDING_COUNT:      ${{ steps.findings.outputs.count }}
+          CRITICAL_COUNT:     ${{ steps.findings.outputs.critical }}
+          HIGH_COUNT:         ${{ steps.findings.outputs.high }}
+          MEDIUM_COUNT:       ${{ steps.findings.outputs.medium }}
+          PR_NUMBER:          ${{ github.event.pull_request.number }}
+          PR_TITLE:           ${{ github.event.pull_request.title }}
+          PR_URL:             ${{ github.event.pull_request.html_url }}
+          REPO:               ${{ github.repository }}
+          GITHUB_SERVER_URL:  ${{ github.server_url }}
+          GITHUB_RUN_ID:      ${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL secret not set — skipping Slack notification."
+            exit 0
+          fi
+
+          python3 - <<'PYEOF'
+          import json, os, urllib.request, urllib.error
+
+          crit  = int(os.environ.get("CRITICAL_COUNT", 0) or 0)
+          high  = int(os.environ.get("HIGH_COUNT",     0) or 0)
+          med   = int(os.environ.get("MEDIUM_COUNT",   0) or 0)
+          total = int(os.environ.get("FINDING_COUNT",  0) or 0)
+
+          if crit > 0 or high > 0:
+              color  = "danger"
+              status = ":red_circle: FAILED"
+          elif total > 0:
+              color  = "warning"
+              status = ":large_yellow_circle: WARNINGS"
+          else:
+              color  = "good"
+              status = ":white_check_mark: PASSED"
+
+          run_url = (
+              f"{os.environ['GITHUB_SERVER_URL']}/"
+              f"{os.environ['REPO']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          )
+
+          payload = {
+              "attachments": [{
+                  "color": color,
+                  "fallback": f"Security scan {status} for PR #{os.environ['PR_NUMBER']}",
+                  "title": f"\U0001f6e1\ufe0f Security Scan \u2014 PR #{os.environ['PR_NUMBER']}: {os.environ['PR_TITLE']}",
+                  "title_link": os.environ["PR_URL"],
+                  "fields": [
+                      {"title": "Status",   "value": status,                              "short": True},
+                      {"title": "Repo",     "value": os.environ["REPO"],                 "short": True},
+                      {"title": "Critical", "value": str(crit),                          "short": True},
+                      {"title": "High",     "value": str(high),                          "short": True},
+                      {"title": "Medium",   "value": str(med),                           "short": True},
+                      {"title": "Total",    "value": str(total),                         "short": True},
+                      {"title": "CodeQL",   "value": os.environ["CODEQL_RESULT"],        "short": True},
+                      {"title": "Trivy",    "value": os.environ["TRIVY_RESULT"],         "short": True},
+                      {"title": "Gitleaks", "value": os.environ["SECRET_SCAN_RESULT"],   "short": True},
+                      {"title": "Sonar",    "value": os.environ["SONAR_RESULT"],         "short": True},
+                  ],
+                  "footer": f"Security Pipeline · <{os.environ['PR_URL']}|View PR> · <{run_url}|View Run>",
+              }]
+          }
+
+          data = json.dumps(payload).encode()
+          req  = urllib.request.Request(
+              os.environ["SLACK_WEBHOOK_URL"],
+              data=data,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  print(f"Slack response: {resp.status} {resp.read().decode()}")
+          except urllib.error.HTTPError as e:
+              print(f"Slack HTTP error: {e.code} {e.read().decode()}")
+              raise
+          PYEOF

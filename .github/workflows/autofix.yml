@@ -60,6 +60,7 @@ jobs:
               // Only react to our own sentinel markers from the security workflow
               const isFindingsComment =
                 body.includes('<!-- trivy-findings-start -->') ||
+                body.includes('<!-- gitleaks-findings-start -->') ||
                 body.includes('🚨 Secret Scan Failure')        ||
                 body.includes('## 🔍 Trivy Security Findings');
 

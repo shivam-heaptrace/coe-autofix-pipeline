@@ -144,8 +144,11 @@ jobs:
       - name: Run Gitleaks
         id: gitleaks
         uses: gitleaks/gitleaks-action@v3
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: detect --source . --exit-code 1
 
       # gitleaks-action always writes results.sarif; --report-path in args is ignored
       - name: Stage Gitleaks SARIF for upload
@@ -153,6 +156,23 @@ jobs:
         run: |
           if [ -f results.sarif ]; then
             cp results.sarif gitleaks-results.sarif
+          fi
+
+      - name: Evaluate Gitleaks findings
+        id: gitleaks-findings
+        if: always()
+        run: |
+          if [ ! -f gitleaks-results.sarif ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          count=$(python3 -c "import json; d=json.load(open('gitleaks-results.sarif')); print(len(d.get('runs',[{}])[0].get('results',[])))")
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" -gt 0 ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload Gitleaks SARIF to GitHub Security tab
@@ -171,10 +191,24 @@ jobs:
           retention-days: 7
 
       - name: Comment on PR if secrets found
-        if: failure() && github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request' && steps.gitleaks-findings.outputs.found == 'true'
         uses: actions/github-script@v7
         with:
           script: |
+            const fs = require('fs');
+            const sarif = JSON.parse(fs.readFileSync('gitleaks-results.sarif', 'utf8'));
+            const results = sarif.runs?.[0]?.results ?? [];
+
+            const lines = results.slice(0, 10).map(r => {
+              const rule = r.ruleId ?? 'unknown';
+              const msg  = r.message?.text ?? '';
+              const loc  = r.locations?.[0]?.physicalLocation ?? {};
+              const file = loc.artifactLocation?.uri ?? '';
+              const line = loc.region?.startLine ?? '?';
+              return `- **${rule}** in \`${file}:${line}\`: ${msg}`;
+            });
+            const more = results.length > 10 ? `\n…and ${results.length - 10} more findings.` : '';
+
             const body = [
               '## 🚨 Secret Scan Failure',
               '',
@@ -182,11 +216,16 @@ jobs:
               '',
               '**Do not merge.** Rotate the credential immediately if it is real.',
               '',
+              '<!-- gitleaks-findings-start -->',
+              ...lines,
+              more,
+              '<!-- gitleaks-findings-end -->',
+              '',
               'The autofix workflow will flag the file and line, but **it cannot safely',
               'remove a secret that has already been committed** — you must rotate first,',
               'then remove the value and force-push to clear history, or use `git filter-repo`.',
               '',
-              '> See the Security tab for the full Gitleaks SARIF report.',
+              '> See the Security tab (Code scanning alerts) for the full Gitleaks SARIF report.',
             ].join('\n');
 
             await github.rest.issues.createComment({
@@ -195,6 +234,12 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body,
             });
+
+      - name: Fail job if secrets found
+        if: steps.gitleaks-findings.outputs.found == 'true'
+        run: |
+          echo "Gitleaks detected ${{ steps.gitleaks-findings.outputs.count }} secret(s)."
+          exit 1
 
   # ──────────────────────────────────────────────
   # 4. SonarCloud quality gate

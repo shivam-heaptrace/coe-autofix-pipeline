@@ -14,20 +14,14 @@ severity:
   # Include MEDIUM for visibility; the autofix gate only pages on CRITICAL/HIGH
   - MEDIUM
 
-vulnerability:
-  # Skip findings where no fix is available yet
-  ignore-unfixed: true
-  # Scan these file types for dependency manifests
-  type:
+pkg:
+  types:
     - os
     - library
 
-# Files/paths to ignore (test fixtures, generated files)
-.trivyignore:
-  - "src/coverage/**"
-  - "**/*.test.js"
-  - "**/*.spec.js"
-  - "node_modules/**"
+vulnerability:
+  # Skip findings where no fix is available yet
+  ignore-unfixed: true
 
 # Output: the workflow overrides this to sarif; keep json here for local use
 format: json

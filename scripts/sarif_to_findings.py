@@ -132,6 +132,20 @@ def infer_tool_name(filename: str) -> str:
     return Path(filename).stem
 
 
+def collect_sarif_files(input_dir: Path) -> list[Path]:
+    """Return SARIF files under input_dir, skipping artifact wrapper directories."""
+    files: set[Path] = set()
+    for path in input_dir.rglob("*"):
+        if path.is_file() and path.suffix.lower() == ".sarif":
+            files.add(path)
+        elif path.is_dir() and path.name.endswith(".sarif"):
+            # dawidd6/action-download-artifact may create a folder named *.sarif
+            for inner in path.rglob("*.sarif"):
+                if inner.is_file():
+                    files.add(inner)
+    return sorted(files)
+
+
 def main():
     global MIN_SEVERITY
 
@@ -151,14 +165,14 @@ def main():
         result = {"total": 0, "findings": []}
     else:
         all_findings: list[dict] = []
-        sarif_files = list(input_dir.rglob("*.sarif"))
+        sarif_files = collect_sarif_files(input_dir)
         if not sarif_files:
             print(f"[warn] No .sarif files found in {input_dir}", file=sys.stderr)
 
         for sarif_file in sarif_files:
             tool = infer_tool_name(sarif_file.name)
             found = extract_findings(sarif_file, tool)
-            print(f"  {sarif_file.name}: {len(found)} findings ({tool})")
+            print(f"  {sarif_file.relative_to(input_dir)}: {len(found)} findings ({tool})")
             all_findings.extend(found)
 
         # Sort: CRITICAL first, then HIGH, then by file for predictable diffs

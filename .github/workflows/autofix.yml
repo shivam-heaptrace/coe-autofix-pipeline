@@ -96,6 +96,12 @@ jobs:
     needs: gate
     if: needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      security-events: read
+      actions: read
+      id-token: write
 
     steps:
       - name: Resolve PR branch
@@ -157,7 +163,7 @@ jobs:
           # model: claude-sonnet-4-6
           allowed_tools: "Bash,Read,Write,Edit"
           disallowed_tools: "WebSearch"
-          prompt: |
+          direct_prompt: |
             You are a security engineer fixing issues found by automated scanners.
             A file called `findings.json` in the repo root contains structured
             findings from CodeQL, Trivy, and Gitleaks. Each finding has:

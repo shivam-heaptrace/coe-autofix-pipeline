@@ -222,7 +222,7 @@ jobs:
 
       - name: Run tests with coverage
         working-directory: src
-        run: npm test -- --coverage --coverageReporters=lcov --if-present
+        run: npm test --if-present -- --coverageReporters=lcov
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@master
